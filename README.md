@@ -268,16 +268,24 @@ fig.show()
 **Создадим новые признаки**
 ````
 df_clean['load_factor'] = df_clean['cargo_weight_tons'] / df_clean.groupby('transport_type')['cargo_weight_tons'].transform('max')
+````
+Отражает загрузку транспортного средства по отношению к максимальной грузоподъёмности для каждого типа транспорта. Показывает, насколько эффективно используется грузоподъёмность.
+````
 df_clean['distance_category'] = pd.cut(df_clean['distance_km'], 
                                  bins=[0, 200, 500, 1000, np.inf],
                                  labels=['short', 'medium', 'long', 'extra_long'])
 ````
+Расстояния разбиваются на категории: короткие (short), средние (medium), длинные (long), очень длинные (extra_long).
+
 **Разделим данные на тестовую и обучающую выборки**
 ````
 X = df_clean[['transport_type', 'distance_km', 'cargo_weight_tons', 'load_factor', 'distance_category']]
 y = df_clean['co2_emissions_kg']
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 ````
+X — матрица признаков, содержащая транспортный тип, расстояние, вес груза, коэффициент загрузки и категорию расстояния.
+y — целевая переменная — выбросы CO₂.
+
 **Создадим пайплайн**
 ````
 numeric_features = ['distance_km', 'cargo_weight_tons', 'load_factor']
@@ -294,6 +302,10 @@ pipeline = Pipeline([
     ('regressor', RandomForestRegressor(random_state=42))
 ])
 ````
+Числовые признаки масштабируются с помощью стандартизации (StandardScaler).
+Категориальные — кодируются с помощью OneHotEncoder, игнорируя неизвестные категории при тестировании.
+В пайплайн включены предварительная обработка и модель случайного леса.
+
 **Проведём подбор гиперпараметров**
 ````
 param_grid = {
@@ -373,3 +385,143 @@ MAE: 0.03 кг
 R2 Score: 0.69
 ['co2_emission_model.pkl']
 ````
+**Создадим оптимизационную модель**
+
+````
+class LogisticsOptimizer:
+````
+**LogisticsOptimizer**
+
+Этот класс предназначен для оценки и оптимизации логистических маршрутов с учетом выбросов CO₂. Он использует предобученную модель машинного обучения для предсказания выбросов по конкретным маршрутам и ищет оптимальное распределение грузов между разными типами транспорта для минимизации общего выброса CO₂. 
+````
+    def __init__(self, model_path, transport_options):
+        self.model = joblib.load(model_path)
+        self.transport_options = transport_options
+        self.transport_types = transport_options['transport_type'].unique()
+````
+````
+    def predict_co2(self, transport_type, distance, weight):
+        """Предсказание выбросов CO2 для конкретного маршрута"""
+        max_weight = self.transport_options[self.transport_options['transport_type'] == transport_type]['cargo_weight_tons'].max()
+        load_factor = weight / max_weight
+        
+        # Определяем категорию расстояния
+        if distance <= 200:
+            dist_cat = 'short'##
+        elif distance <= 500:
+            dist_cat = 'medium'
+        elif distance <= 1000:
+            dist_cat = 'long'
+        else:
+            dist_cat = 'extra_long'
+            
+        input_data = pd.DataFrame([{
+            'transport_type': transport_type,
+            'distance_km': distance,
+            'cargo_weight_tons': weight,
+            'load_factor': load_factor,
+            'distance_category': dist_cat
+        }])
+        
+        return self.model.predict(input_data)[0]
+````
+Метод predict_co2 делает предсказание выбросов CO₂ для заданных параметров маршрута. Находит максимальную грузоподъемность для выбранного типа транспорта. Вычисляет коэффициент загрузки (load_factor). Определяет категорию расстояния (short, medium, long, extra_long). Создает входные данные для модели и предсказывает выбросы CO₂.
+````
+    def optimize(self, total_cargo, origin, destination, distance):
+        """Оптимизация распределения груза"""
+        # Доступные типы транспорта
+        available_transports = self.transport_options['transport_type'].unique()
+        n_transports = len(available_transports)
+        
+        # Целевая функция
+        def objective(x):
+            weights = x * total_cargo
+            total_co2 = 0
+            for i, transport in enumerate(available_transports):
+                if weights[i] > 0:
+                    total_co2 += self.predict_co2(transport, distance, weights[i])
+            return total_co2
+        
+        # Ограничения
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})  # Сумма долей = 1
+        
+        # Границы
+        bounds = [(0, 1) for _ in range(n_transports)]
+        
+        # Начальное предположение (равномерное распределение)
+        x0 = np.ones(n_transports) / n_transports
+        
+        # Оптимизация
+        result = minimize(objective, x0, method='SLSQP',
+                         bounds=bounds, constraints=constraints)
+        
+        # Обработка результатов
+        if result.success:
+            optimal_weights = result.x * total_cargo
+            solution = pd.DataFrame({
+                'transport_type': available_transports,
+                'weight': optimal_weights,
+                'co2': [self.predict_co2(t, distance, w) 
+                        for t, w in zip(available_transports, optimal_weights)]
+            })
+            solution = solution[solution['weight'] > 0.1]  # Фильтрация незначительных
+            return solution.sort_values('co2')
+        else:
+            print("Оптимизация не удалась:", result.message)
+            return None
+````
+Метод optimize определяет оптимальное распределение общего груза между доступными видами транспорта для минимизации общего выброса CO₂. Создает функцию objective, которая суммирует выбросы CO₂ при заданных долях грузов. Ограничение — сумма долей равна 1 (полное распределение). Границы — доля каждого вида транспорта от 0 до 1. Начинает с равномерного распределения. Использует алгоритм SLSQP для минимизации функции. Если оптимизация успешна, возвращает таблицу с типами транспорта, распределенными весами и предсказанными выбросами. Фильтрует незначительные объемы (меньше 0.1 тонны) и сортирует по CO₂.
+
+**Пример использования оптимизатора**
+````
+optimizer = LogisticsOptimizer('co2_emission_model.pkl', df_clean)
+solution = optimizer.optimize(total_cargo=2.643378, 
+                            origin='Dayton OH', 
+                            destination='Rest of OH', 
+                            distance=0.213486	)
+print("\nОптимальное распределение груза:")
+print(solution)
+````
+````
+Оптимальное распределение груза:
+            transport_type    weight       co2
+6                 Pipeline  0.377625  0.000882
+2    Multiple modes & mail  0.377625  0.001074
+3                     Rail  0.377625  0.001281
+4                    Water  0.377625  0.002936
+0                    Truck  0.377625  0.005796
+5        Other and unknown  0.377625  0.006894
+1  Air (include truck-air)  0.377625  0.066143
+````
+**Интерактивная визуализация**
+
+Функция plot_optimization создает интерактивную географическую визуализацию, показывающую маршруты текущей сети и их оптимизированные версии. С помощью библиотеки Plotly она отображает точки отправления и назначения, а также линии маршрутов, чтобы наглядно сравнить исходное распределение грузов с улучшенным.
+
+<img width="1305" height="326" alt="визуализация" src="https://github.com/user-attachments/assets/1041a0d7-187a-4641-8671-feeba0054ccf" />
+
+**План поэтапного внедрения оптимизированной логистической стратегии:**
+
+1. Подготовительный этап (1-2 месяца):
+   - Аудит текущей логистической инфраструктуры
+   - Обучение персонала работе с новой системой
+   - Тестирование модели на исторических данных
+
+2. Пилотный проект (3-4 месяца):
+   - Внедрение оптимизации для 10% маршрутов
+   - Мониторинг ключевых показателей
+   - Корректировка модели по результатам
+
+3. Полномасштабное внедрение (6-12 месяцев):
+   - Постепенный переход на оптимизированные маршруты
+   - Интеграция с системами управления транспортом
+   - Регулярный пересмотр модели (каждые 3 месяца)
+
+4. Дальнейшее развитие:
+   - Внедрение IoT-датчиков для точного учета выбросов
+   - Оптимизация в реальном времени
+   - Расширение на международные перевозки
+
+**Ключевые показатели успеха:**
+- Снижение выбросов CO2 на 15-25% в первый год
+- Уменьшение логистических затрат на 5-10%
+- Повышение точности планирования на 20%
